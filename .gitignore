@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+*.db
+*.sqlite
+*.sqlite3
+
+logs/
+data/
+
+.vscode/
+.idea/
+
+*.tflite
+.env

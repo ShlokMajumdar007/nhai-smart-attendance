@@ -1,0 +1,41 @@
+{
+  "model_name": "MobileFaceNet",
+  "version": "2.0.0",
+  "input_shape": [1, 112, 112, 3],
+  "output_shape": [1, 192],
+
+  "input_mean": 127.5,
+  "input_std": 128.0,
+
+  "embedding_dim": 192,
+  "l2_normalized": true,
+
+  "similarity_threshold": 0.72,
+
+  "min_face_size": 80,
+  "max_faces": 1,
+
+  "blur_threshold": 100.0,
+  "brightness_min": 40,
+  "brightness_max": 220,
+
+  "enrollment_frames": 15,
+  "verification_frames": 3,
+
+  "liveness_challenges": [
+    "blink",
+    "smile",
+    "head_left",
+    "head_right"
+  ],
+
+  "model_file": "mobilefacenet.tflite",
+  "inference_backend": "tensorflow-lite",
+
+  "license": "Apache-2.0",
+
+  "description": "Mobile face recognition model producing 192-dimensional embeddings for offline authentication and attendance verification.",
+
+  "created_for": "NHAI Drishti",
+  "offline_capable": true
+}
