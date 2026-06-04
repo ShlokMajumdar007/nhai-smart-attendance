@@ -9,7 +9,7 @@ import time
 import numpy as np
 import logging
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
 from ai.liveness.blink import BlinkDetector
@@ -50,75 +50,26 @@ class ChallengeState:
 class ChallengeManager:
     """
     Manages a single liveness challenge round.
-    Instantiate once; call process() each frame (main.py API),
-    or use start()/update() directly.
+    Instantiate per-session; call update() each frame.
     """
 
     def __init__(
         self,
         challenge_types: Optional[list] = None,
         timeout: float = CHALLENGE_TIMEOUT_SECONDS,
-        enabled: bool = True,          # ← extra kwarg accepted by main.py
     ):
         self.available_challenges = challenge_types or list(ChallengeType)
         self.timeout = timeout
-        self.enabled = enabled
 
         self._challenge: Optional[ChallengeType] = None
         self._detector = None
         self._start_time: Optional[float] = None
         self._passed = False
         self._failed = False
+
+        # Calibration for smile
         self._calibration_done = False
         self._calibration_frame_count = 0
-
-    # ------------------------------------------------------------------
-    # Main entry point called by main.py RecognitionPipeline.run_liveness()
-    # ------------------------------------------------------------------
-
-    def process(self, frame: np.ndarray, detection) -> bool:
-        """
-        Adapter used by main.py.
-
-        Called every frame with (frame, FaceDetection).
-        Returns True when the current challenge has been passed,
-        False while still pending or if liveness is disabled.
-
-        Internally manages the start → update → pass/fail cycle so
-        the caller only has to call this once per frame.
-        """
-        if not self.enabled:
-            return True
-
-        landmarks = getattr(detection, "landmarks", None)
-        if landmarks is None or landmarks.size == 0:
-            return False
-
-        # Start a new challenge if none is active
-        if self._challenge is None or self._failed:
-            self.start()
-
-        # Already passed — signal True and auto-reset for next person
-        if self._passed:
-            self.reset()
-            return True
-
-        # Build pose dict if detector has it
-        pose = None
-        if self._challenge in (ChallengeType.HEAD_LEFT, ChallengeType.HEAD_RIGHT):
-            try:
-                from ai.detector.face_detector import FaceDetector
-                # pose is passed via detection if available
-                pose = getattr(detection, "pose", None)
-            except Exception:
-                pass
-
-        state = self.update(landmarks, pose=pose)
-        return state.passed
-
-    # ------------------------------------------------------------------
-    # Lower-level start / update API
-    # ------------------------------------------------------------------
 
     def start(self, challenge: Optional[ChallengeType] = None) -> ChallengeState:
         """Start a new challenge. If challenge is None, pick randomly."""
@@ -129,6 +80,7 @@ class ChallengeManager:
         self._calibration_done = False
         self._calibration_frame_count = 0
 
+        # Instantiate the correct detector
         if self._challenge == ChallengeType.BLINK:
             self._detector = BlinkDetector(required_blinks=1)
         elif self._challenge == ChallengeType.SMILE:
@@ -138,7 +90,8 @@ class ChallengeManager:
         elif self._challenge == ChallengeType.HEAD_RIGHT:
             self._detector = HeadTurnDetector(direction="right")
 
-        logger.info("Liveness challenge started: %s", self._challenge.value)
+        logger.info(f"Liveness challenge started: {self._challenge.value}")
+
         return self._make_state(0.0)
 
     def update(self, landmarks: np.ndarray, pose: Optional[dict] = None) -> ChallengeState:
@@ -146,7 +99,7 @@ class ChallengeManager:
         Update challenge with new frame data.
 
         Args:
-            landmarks: (468, 3) MediaPipe face mesh landmarks in pixel space
+            landmarks: (468, 3) MediaPipe face mesh landmarks
             pose: dict with yaw/pitch/roll (required for head turn challenges)
 
         Returns:
@@ -161,11 +114,13 @@ class ChallengeManager:
         elapsed = time.monotonic() - self._start_time
         time_remaining = max(0.0, self.timeout - elapsed)
 
+        # Timeout
         if time_remaining <= 0:
             self._failed = True
-            logger.warning("Challenge timed out: %s", self._challenge.value)
+            logger.warning(f"Challenge timed out: {self._challenge.value}")
             return self._make_state(0.0)
 
+        # Run appropriate detector
         progress = 0.0
 
         if self._challenge == ChallengeType.BLINK:
@@ -175,6 +130,7 @@ class ChallengeManager:
                 self._passed = True
 
         elif self._challenge == ChallengeType.SMILE:
+            # Calibrate for first N frames
             if not self._calibration_done:
                 self._detector.calibrate(landmarks)
                 self._calibration_frame_count += 1
@@ -189,7 +145,7 @@ class ChallengeManager:
 
         elif self._challenge in (ChallengeType.HEAD_LEFT, ChallengeType.HEAD_RIGHT):
             if pose is None:
-                return self._make_state(0.0, time_remaining)
+                return self._make_state(0.0)
             result = self._detector.update(pose)
             stage_progress = {
                 "await_turn": 0.1,
@@ -245,5 +201,3 @@ class ChallengeManager:
         self._start_time = None
         self._passed = False
         self._failed = False
-        self._calibration_done = False
-        self._calibration_frame_count = 0

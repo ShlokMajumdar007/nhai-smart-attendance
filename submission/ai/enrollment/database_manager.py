@@ -1,24 +1,10 @@
-"""
-ai/storage/database_manager.py
-================================
-Single authoritative SQLite manager for NHAI Drishti.
-
-Schema (unified — satisfies both recognition and enrollment callers):
-  users            — enrolled employees + their face embeddings
-  attendance       — every verified attendance event
-  sync_queue       — payloads waiting for AWS upload
-
-Thread-safety: thread-local connections + WAL mode.
-"""
-
 from __future__ import annotations
-
 import json
 import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Generator, List, Optional
@@ -28,17 +14,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Dataclasses
+# Path constants
 # ---------------------------------------------------------------------------
 
-@dataclass
-class EmbeddingEntry:
-    """Lightweight record returned to the recognition cache loader."""
-    user_id: str
-    employee_code: str
-    name: str
-    department: str
-    embedding: np.ndarray
+DB_DIR = Path("storage")
+DB_PATH = DB_DIR / "attendance.db"
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -64,20 +48,29 @@ class UserRecord:
 
 @dataclass
 class AttendanceRecord:
-    record_id: Optional[int]
     user_id: str
     confidence: float
     challenge_type: str
     liveness_passed: bool
     timestamp: str
     synced: bool = False
+    record_id: Optional[int] = None
 
 
 @dataclass
 class SyncPayload:
-    payload_id: Optional[int]
     payload: str
     created_at: str
+    payload_id: Optional[int] = None
+
+
+@dataclass
+class EmbeddingEntry:
+    user_id: str
+    employee_code: str
+    name: str
+    department: str
+    embedding: np.ndarray
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +91,14 @@ CREATE TABLE IF NOT EXISTS users (
 
 _DDL_ATTENDANCE = """
 CREATE TABLE IF NOT EXISTS attendance_logs (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id         TEXT    NOT NULL,
-    confidence      REAL    NOT NULL,
-    challenge_type  TEXT    NOT NULL DEFAULT 'none',
-    liveness_passed INTEGER NOT NULL DEFAULT 1,
-    timestamp       TEXT    NOT NULL,
-    synced          INTEGER NOT NULL DEFAULT 0
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        TEXT    NOT NULL,
+    confidence     REAL    NOT NULL,
+    challenge_type TEXT    NOT NULL,
+    liveness_passed INTEGER NOT NULL,
+    timestamp      TEXT    NOT NULL,
+    synced         INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 """
 
@@ -112,8 +106,7 @@ _DDL_SYNC = """
 CREATE TABLE IF NOT EXISTS sync_queue (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     payload    TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    retry_count INTEGER NOT NULL DEFAULT 0
+    created_at TEXT NOT NULL
 );
 """
 
@@ -128,6 +121,7 @@ _DDL_INDEXES = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _embedding_to_json(embedding: np.ndarray) -> str:
     return json.dumps(embedding.tolist())
@@ -145,29 +139,19 @@ def _now_iso() -> str:
 # DatabaseManager
 # ---------------------------------------------------------------------------
 
+
 class DatabaseManager:
     """
     Thread-safe SQLite manager for the NHAI attendance system.
 
-    One instance is shared across the application. Each public method
-    acquires a thread-local connection so concurrent threads never share
-    a single sqlite3.Connection object.
-
-    Provides:
-      - User CRUD + embedding storage
-      - Attendance logging
-      - Sync queue management
-      - Methods expected by both EnrollmentManager and RecognitionManager
+    One instance is shared across the application.  Each public method
+    acquires a connection from a thread-local pool so concurrent threads
+    never share a single sqlite3.Connection object.
     """
 
-    def __init__(self, db_path: str = "data/drishti.db") -> None:
-        self.db_path = db_path          # keep as str for backward compat
-        self._db_path = Path(db_path)
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        self._db_path = db_path
         self._local = threading.local()
-
-    def initialize(self) -> None:
-        """Explicit initialisation call (matches original storage API)."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         logger.info("DatabaseManager initialised → %s", self._db_path)
 
@@ -177,7 +161,6 @@ class DatabaseManager:
 
     def _get_connection(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
             self._local.conn = sqlite3.connect(
                 str(self._db_path),
                 check_same_thread=False,
@@ -187,11 +170,6 @@ class DatabaseManager:
             self._local.conn.execute("PRAGMA journal_mode=WAL;")
             self._local.conn.execute("PRAGMA foreign_keys=ON;")
         return self._local.conn
-
-    @property
-    def connection(self) -> sqlite3.Connection:
-        """Backward-compatible direct connection access."""
-        return self._get_connection()
 
     @contextmanager
     def _cursor(self) -> Generator[sqlite3.Cursor, None, None]:
@@ -206,7 +184,12 @@ class DatabaseManager:
         finally:
             cursor.close()
 
+    # ------------------------------------------------------------------
+    # Schema initialisation
+    # ------------------------------------------------------------------
+
     def _init_db(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._cursor() as cur:
             cur.execute(_DDL_USERS)
             cur.execute(_DDL_ATTENDANCE)
@@ -216,10 +199,14 @@ class DatabaseManager:
         logger.debug("Database schema verified.")
 
     # ------------------------------------------------------------------
-    # User / Enrollment operations
+    # User operations
     # ------------------------------------------------------------------
 
     def add_user(self, record: UserRecord) -> bool:
+        """
+        Insert a new user.  Returns True on success, False if the
+        employee_code already exists.
+        """
         sql = """
             INSERT INTO users
                 (user_id, employee_code, name, department, embedding, last_seen, created_at)
@@ -248,22 +235,95 @@ class DatabaseManager:
             )
             return False
 
+    def update_user(
+        self,
+        user_id: str,
+        *,
+        name: Optional[str] = None,
+        department: Optional[str] = None,
+        embedding: Optional[np.ndarray] = None,
+    ) -> bool:
+        """
+        Partially update a user record.  Pass only the fields to change.
+        Returns True when a row was actually modified.
+        """
+        updates: list[str] = []
+        params: list = []
+
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if department is not None:
+            updates.append("department = ?")
+            params.append(department)
+        if embedding is not None:
+            updates.append("embedding = ?")
+            params.append(_embedding_to_json(embedding))
+
+        if not updates:
+            logger.debug("update_user called with no fields to change for %s", user_id)
+            return False
+
+        params.append(user_id)
+        sql = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            changed = cur.rowcount > 0
+
+        if changed:
+            logger.info("User updated: %s", user_id)
+        else:
+            logger.warning("update_user found no row for user_id=%s", user_id)
+
+        return changed
+
+    def delete_user(self, user_id: str) -> bool:
+        """
+        Hard-delete a user.  Attendance logs are preserved (user_id FK is
+        intentionally not CASCADE so audit records survive).
+        Returns True when a row was deleted.
+        """
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            deleted = cur.rowcount > 0
+
+        if deleted:
+            logger.info("User deleted: %s", user_id)
+        else:
+            logger.warning("delete_user found no row for user_id=%s", user_id)
+
+        return deleted
+
     def get_user(self, user_id: str) -> Optional[UserRecord]:
+        """Fetch a single user by primary key."""
         with self._cursor() as cur:
             cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             row = cur.fetchone()
-        return self._row_to_user(row) if row else None
+
+        if row is None:
+            return None
+
+        return self._row_to_user(row)
 
     def get_user_by_employee_code(self, employee_code: str) -> Optional[UserRecord]:
+        """Fetch a user by NHAI employee code."""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT * FROM users WHERE employee_code = ?", (employee_code,)
             )
             row = cur.fetchone()
-        return self._row_to_user(row) if row else None
+
+        if row is None:
+            return None
+
+        return self._row_to_user(row)
 
     def get_all_embeddings(self) -> List[EmbeddingEntry]:
-        """Return embedding entries for every enrolled user (used by recognition cache)."""
+        """
+        Return lightweight embedding entries for every enrolled user.
+        Used by RecognitionManager to build its in-memory similarity index.
+        """
         with self._cursor() as cur:
             cur.execute(
                 "SELECT user_id, employee_code, name, department, embedding FROM users"
@@ -291,13 +351,8 @@ class DatabaseManager:
         logger.debug("Loaded %d embeddings from database.", len(entries))
         return entries
 
-    def get_total_users(self) -> int:
-        with self._cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM users")
-            row = cur.fetchone()
-        return row[0] if row else 0
-
     def update_last_seen(self, user_id: str, timestamp: Optional[str] = None) -> None:
+        """Stamp the last successful recognition time on a user record."""
         ts = timestamp or _now_iso()
         with self._cursor() as cur:
             cur.execute(
@@ -306,17 +361,29 @@ class DatabaseManager:
         logger.debug("last_seen updated for user_id=%s → %s", user_id, ts)
 
     def user_exists(self, user_id: str) -> bool:
+        """Fast existence check that avoids loading the full row."""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM users WHERE user_id = ? LIMIT 1", (user_id,)
             )
             return cur.fetchone() is not None
 
+    def get_total_users(self) -> int:
+        """Return the total number of enrolled users."""
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users")
+            row = cur.fetchone()
+        return row[0] if row else 0
+
     # ------------------------------------------------------------------
     # Attendance operations
     # ------------------------------------------------------------------
 
     def log_attendance(self, record: AttendanceRecord) -> int:
+        """
+        Insert an attendance event.  Returns the auto-generated row id so
+        the caller can reference it in the sync queue payload.
+        """
         sql = """
             INSERT INTO attendance_logs
                 (user_id, confidence, challenge_type, liveness_passed, timestamp, synced)
@@ -334,24 +401,22 @@ class DatabaseManager:
             row_id: int = cur.lastrowid  # type: ignore[assignment]
 
         logger.info(
-            "Attendance logged: user=%s conf=%.3f id=%d",
-            record.user_id, record.confidence, row_id,
+            "Attendance logged: user=%s conf=%.3f challenge=%s liveness=%s id=%d",
+            record.user_id, record.confidence,
+            record.challenge_type, record.liveness_passed, row_id,
         )
         return row_id
 
-    def save_attendance(self, record: dict) -> int:
-        """Dict-based convenience wrapper (used by AttendancePipeline in main.py)."""
-        att = AttendanceRecord(
-            record_id=None,
-            user_id=record.get("subject_id", record.get("user_id", "")),
-            confidence=float(record.get("confidence", 0.0)),
-            challenge_type=record.get("challenge_type", "none"),
-            liveness_passed=bool(record.get("liveness_passed", True)),
-            timestamp=record.get("timestamp", _now_iso()),
-        )
-        return self.log_attendance(att)
+    def mark_attendance_synced(self, record_id: int) -> None:
+        """Mark an attendance log row as successfully pushed to AWS."""
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE attendance_logs SET synced = 1 WHERE id = ?", (record_id,)
+            )
+        logger.debug("Attendance record %d marked synced.", record_id)
 
     def get_unsynced_attendance(self) -> List[AttendanceRecord]:
+        """Return all attendance rows not yet pushed to AWS."""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT * FROM attendance_logs WHERE synced = 0 ORDER BY timestamp"
@@ -371,34 +436,34 @@ class DatabaseManager:
             for row in rows
         ]
 
-    def mark_attendance_synced(self, record_id: int) -> None:
-        with self._cursor() as cur:
-            cur.execute(
-                "UPDATE attendance_logs SET synced = 1 WHERE id = ?", (record_id,)
-            )
-
     # ------------------------------------------------------------------
     # Sync queue operations
     # ------------------------------------------------------------------
 
     def enqueue_sync(self, payload: dict) -> int:
+        """
+        Serialise a dict payload and push it to the offline sync queue.
+        Returns the queue row id.
+        """
+        sql = "INSERT INTO sync_queue (payload, created_at) VALUES (?, ?)"
         raw = json.dumps(payload, ensure_ascii=False)
         now = _now_iso()
+
         with self._cursor() as cur:
-            cur.execute(
-                "INSERT INTO sync_queue (payload, created_at) VALUES (?, ?)",
-                (raw, now),
-            )
+            cur.execute(sql, (raw, now))
             row_id: int = cur.lastrowid  # type: ignore[assignment]
+
         logger.debug("Sync payload enqueued id=%d", row_id)
         return row_id
 
     def dequeue_sync(self, limit: int = 50) -> List[SyncPayload]:
+        """Fetch the oldest unprocessed sync payloads (FIFO)."""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT * FROM sync_queue ORDER BY created_at LIMIT ?", (limit,)
             )
             rows = cur.fetchall()
+
         return [
             SyncPayload(
                 payload_id=row["id"],
@@ -409,10 +474,13 @@ class DatabaseManager:
         ]
 
     def remove_sync_payload(self, payload_id: int) -> None:
+        """Remove a successfully uploaded payload from the queue."""
         with self._cursor() as cur:
             cur.execute("DELETE FROM sync_queue WHERE id = ?", (payload_id,))
+        logger.debug("Sync payload %d removed from queue.", payload_id)
 
     def get_sync_queue_depth(self) -> int:
+        """How many payloads are waiting to be pushed."""
         with self._cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM sync_queue")
             row = cur.fetchone()
@@ -435,6 +503,7 @@ class DatabaseManager:
         )
 
     def close(self) -> None:
+        """Close the thread-local connection if open."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
