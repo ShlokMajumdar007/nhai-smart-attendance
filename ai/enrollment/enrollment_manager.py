@@ -32,7 +32,7 @@ KEEP_FRAMES: int = 12
 MIN_FACE_SIZE: int = 80
 MAX_BLUR_VARIANCE: float = 15.0
 MIN_BRIGHTNESS: float = 40.0
-MAX_BRIGHTNESS: float = 230.0
+MAX_BRIGHTNESS: float = 255.0
 FRAME_CAPTURE_DELAY: float = 0.12
 FACE_INPUT_SIZE: Tuple[int, int] = (112, 112)
 
@@ -337,19 +337,17 @@ class EnrollmentManager:
             ok, frame = read_fn()
             if not ok or frame is None:
                 no_frame_count += 1
-                if no_frame_count <= 3 or no_frame_count % 10 == 0:
                 time.sleep(FRAME_CAPTURE_DELAY)
                 continue
 
             detection = self._detector.detect(frame)
             if detection is None:
                 no_face_count += 1
-                if no_face_count <= 3 or no_face_count % 10 == 0:
                 time.sleep(FRAME_CAPTURE_DELAY)
                 continue
             if not detection.is_valid:
                 no_face_count += 1
-                if no_face_count <= 3 or no_face_count % 10 == 0:
+                logger.debug("Frame rejected: %s", detection.rejection_reason)
                 time.sleep(FRAME_CAPTURE_DELAY)
                 continue
 

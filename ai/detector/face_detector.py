@@ -44,7 +44,7 @@ class FaceDetector:
         min_face_size: int = 80,
         blur_threshold: float = 100.0,
         brightness_min: int = 40,
-        brightness_max: int = 220,
+        brightness_max: int = 255,
         target_size: Tuple[int, int] = (112, 112),
         min_detection_confidence: float = 0.7,
         static_image_mode: bool = False,

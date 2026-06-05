@@ -169,7 +169,7 @@ class DatabaseManager:
         """Explicit initialisation call (matches original storage API)."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-        logger.info("DatabaseManager initialised → %s", self._db_path)
+        logger.info("DatabaseManager initialised: %s", self._db_path)
 
     # ------------------------------------------------------------------
     # Internal connection management
@@ -303,7 +303,7 @@ class DatabaseManager:
             cur.execute(
                 "UPDATE users SET last_seen = ? WHERE user_id = ?", (ts, user_id)
             )
-        logger.debug("last_seen updated for user_id=%s → %s", user_id, ts)
+        logger.debug("last_seen updated for user_id=%s -> %s", user_id, ts)
 
     def user_exists(self, user_id: str) -> bool:
         with self._cursor() as cur:

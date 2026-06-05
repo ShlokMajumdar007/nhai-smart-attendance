@@ -42,7 +42,7 @@ def configure_logging() -> logging.Logger:
     date_format = "%Y-%m-%d %H:%M:%S"
 
     handlers = [
-        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(stream=open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)),
         logging.FileHandler(log_dir / f"drishti_{datetime.now():%Y%m%d}.log"),
     ]
 
@@ -76,7 +76,7 @@ class SystemConfig:
     min_face_confidence: float = 0.70
     min_blur_threshold: float = 10.0
     min_brightness: float = 40.0
-    max_brightness: float = 240.0
+    max_brightness: float = 255.0
     model_dir: str = "ai/models"
     db_path: str = "data/drishti.db"
     frame_skip: int = 2
