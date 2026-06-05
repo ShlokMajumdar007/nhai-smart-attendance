@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Tunable constants
 # ---------------------------------------------------------------------------
 
-VERIFICATION_THRESHOLD: float = 0.72   # cosine similarity ≥ this → match
+VERIFICATION_THRESHOLD: float = 0.55   # cosine similarity ≥ this → match
 EMBEDDING_RELOAD_INTERVAL: float = 30.0  # seconds between automatic reloads
 LIVENESS_REQUIRED: bool = True           # set False only in dev / unit tests
 ATTENDANCE_COOLDOWN_SECONDS: int = 300   # avoid double-logging same person

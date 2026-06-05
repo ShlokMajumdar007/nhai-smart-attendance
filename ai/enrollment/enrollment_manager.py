@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 CAPTURE_FRAMES: int = 15
 KEEP_FRAMES: int = 12
 MIN_FACE_SIZE: int = 80
-MAX_BLUR_VARIANCE: float = 60.0
+MAX_BLUR_VARIANCE: float = 15.0
 MIN_BRIGHTNESS: float = 40.0
 MAX_BRIGHTNESS: float = 230.0
 FRAME_CAPTURE_DELAY: float = 0.12
@@ -314,19 +314,42 @@ class EnrollmentManager:
         frames: List[np.ndarray] = []
         boxes: List[Tuple[int, int, int, int]] = []
 
+        # Accept either a cv2.VideoCapture (has .read() method) or a plain
+        # callable that returns (ok, frame) — used when CameraProcessor shares
+        # its latest frame to avoid concurrent reads on the same VideoCapture.
+        if callable(camera) and not hasattr(camera, "read"):
+            read_fn = camera
+        else:
+            read_fn = camera.read
+
         attempts = 0
         max_attempts = CAPTURE_FRAMES * 3
+        no_frame_count = 0
+        no_face_count = 0
+
+        logger.info(
+            "_capture_frames START: target=%d max_attempts=%d read_fn=%s",
+            CAPTURE_FRAMES, max_attempts, read_fn,
+        )
 
         while len(frames) < CAPTURE_FRAMES and attempts < max_attempts:
             attempts += 1
-            ok, frame = camera.read()
+            ok, frame = read_fn()
             if not ok or frame is None:
+                no_frame_count += 1
+                if no_frame_count <= 3 or no_frame_count % 10 == 0:
                 time.sleep(FRAME_CAPTURE_DELAY)
                 continue
 
             detection = self._detector.detect(frame)
-            # FaceDetector returns a FaceDetection or None
-            if detection is None or not detection.is_valid:
+            if detection is None:
+                no_face_count += 1
+                if no_face_count <= 3 or no_face_count % 10 == 0:
+                time.sleep(FRAME_CAPTURE_DELAY)
+                continue
+            if not detection.is_valid:
+                no_face_count += 1
+                if no_face_count <= 3 or no_face_count % 10 == 0:
                 time.sleep(FRAME_CAPTURE_DELAY)
                 continue
 
@@ -334,8 +357,14 @@ class EnrollmentManager:
             x1, y1, fw, fh = detection.bbox
             frames.append(frame.copy())
             boxes.append((x1, y1, fw, fh))
+            logger.info("attempt %d/%d: frame %d accepted (bbox=%s)",
+                        attempts, max_attempts, len(frames), detection.bbox)
             time.sleep(FRAME_CAPTURE_DELAY)
 
+        logger.info(
+            "_capture_frames END: collected=%d/%d attempts=%d no_frame=%d no_face=%d",
+            len(frames), CAPTURE_FRAMES, attempts, no_frame_count, no_face_count,
+        )
         return frames, boxes
 
     def _extract_embedding(

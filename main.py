@@ -68,13 +68,13 @@ class SystemConfig:
     camera_width: int = 1280
     camera_height: int = 720
     camera_fps: int = 30
-    recognition_threshold: float = 0.65
+    recognition_threshold: float = 0.50
     attendance_cooldown_seconds: int = 300
     liveness_enabled: bool = True
     sync_interval_seconds: int = 60
     max_sync_retries: int = 3
-    min_face_confidence: float = 0.85
-    min_blur_threshold: float = 50.0
+    min_face_confidence: float = 0.70
+    min_blur_threshold: float = 10.0
     min_brightness: float = 40.0
     max_brightness: float = 240.0
     model_dir: str = "ai/models"
@@ -419,6 +419,10 @@ class CameraProcessor:
         self._log = logging.getLogger("drishti.camera")
         # Guard: prevent re-entrant enrollment if user holds E key down
         self._enrollment_in_progress = False
+        # Shared latest frame — written by run() loop, read by enrollment.
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_seq: int = 0           # monotonic counter, incremented every new frame
+        self._frame_lock = threading.Lock()
 
     def _open_camera(self) -> cv2.VideoCapture:
         self._log.info("Opening camera index=%d", self._config.camera_index)
@@ -575,6 +579,12 @@ class CameraProcessor:
 
             consecutive_failures = 0
 
+            # Update shared latest frame so enrollment can read it
+            # without competing for the VideoCapture object.
+            with self._frame_lock:
+                self._latest_frame = frame.copy()
+                self._frame_seq += 1
+
             try:
                 self._process_frame(frame)
             except Exception as exc:
@@ -607,7 +617,16 @@ class CameraProcessor:
             if self._enrollment_in_progress:
                 print("\n[ENROLLMENT] Already in progress — please wait.")
                 return
-            self._run_enrollment_interactive()
+            # Run enrollment on a background thread so the camera loop
+            # keeps calling self._cap.read() and _latest_frame stays fresh.
+            # Blocking here (synchronous call) would freeze the loop while
+            # input() waits for the operator, leaving _latest_frame stale.
+            t = threading.Thread(
+                target=self._run_enrollment_interactive,
+                name="enrollment-thread",
+                daemon=True,
+            )
+            t.start()
 
     def _run_enrollment_interactive(self) -> None:
         """
@@ -641,8 +660,27 @@ class CameraProcessor:
             print("\n  Look directly at the camera and hold still …")
             print("  Capturing 15 frames for quality analysis.\n")
 
+            # Use a monotonic sequence number so the getter only returns
+            # a frame when the run() loop has genuinely written a new one.
+            # id() is NOT safe here — CPython reuses addresses after GC,
+            # causing the getter to see a "new" id that is actually the old
+            # frame's recycled slot, or vice-versa.
+            _last_seq: list = [-1]  # list so the closure can mutate it
+
+            def _frame_getter():
+                """Return the latest frame only when its seq number has advanced."""
+                with self._frame_lock:
+                    seq = self._frame_seq
+                    f   = self._latest_frame
+                if f is None:
+                    return False, None
+                if seq == _last_seq[0]:
+                    return False, None   # same frame — caller will retry
+                _last_seq[0] = seq
+                return True, f.copy()
+
             report = self._enrollment_manager.enroll(
-                camera=self._cap,
+                camera=_frame_getter,
                 employee_code=employee_code,
                 name=name,
                 department=department,
@@ -774,9 +812,19 @@ class DrishtiApplication:
             threshold=self._config.recognition_threshold,
         )
         self._embedding_cache.load_embeddings()
+        # EnrollmentManager runs on its own thread while the camera loop
+        # simultaneously uses self._face_detector via RecognitionPipeline.
+        # MediaPipe is NOT thread-safe — give enrollment its own detector.
+        #
+        # Use static_image_mode=True so MediaPipe treats every frame
+        # independently. The default tracking mode (static_image_mode=False)
+        # needs several frames to "warm up" its tracker from a cold start;
+        # on a freshly constructed detector this causes no detections for
+        # the first N frames, burning through max_attempts before lock-on.
+        enrollment_detector = FaceDetector(static_image_mode=True, blur_threshold=20.0)
         self._enrollment_manager = EnrollmentManager(
             db_manager=self._db_manager,
-            face_detector=self._face_detector,
+            face_detector=enrollment_detector,
             model=self._model,
         )
         enrolled_count = self._embedding_cache.get_enrolled_count()

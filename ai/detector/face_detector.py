@@ -47,6 +47,7 @@ class FaceDetector:
         brightness_max: int = 220,
         target_size: Tuple[int, int] = (112, 112),
         min_detection_confidence: float = 0.7,
+        static_image_mode: bool = False,
     ):
         self.min_face_size = min_face_size
         self.blur_threshold = blur_threshold
@@ -56,7 +57,7 @@ class FaceDetector:
 
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
+            static_image_mode=static_image_mode,
             max_num_faces=2,           # detect up to 2 to reject multi-face
             refine_landmarks=True,
             min_detection_confidence=min_detection_confidence,
