@@ -10,9 +10,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-YAW_LEFT_THRESHOLD = -20.0    # degrees — negative = left
-YAW_RIGHT_THRESHOLD = 20.0    # degrees — positive = right
-SUSTAINED_FRAMES = 8           # frames to hold turn
+# Tuned for universal camera acceptance:
+# - Lower yaw thresholds (15 deg) — wide-angle laptop/phone cameras already
+#   exaggerate angular displacement so 20 was too hard for close-up shots
+# - Fewer sustained frames (5) — allows challenge completion at 15 fps
+YAW_LEFT_THRESHOLD  = -15.0   # was -20 — more achievable on wide-angle lenses
+YAW_RIGHT_THRESHOLD =  15.0   # was  20 — more achievable on wide-angle lenses
+SUSTAINED_FRAMES    = 5        # was 8 — works at 15 fps without holding too long
 
 
 class HeadTurnDetector:
@@ -24,9 +28,9 @@ class HeadTurnDetector:
     def __init__(
         self,
         direction: str = "left",         # "left" or "right"
-        yaw_threshold: float = 20.0,     # absolute degrees
+        yaw_threshold: float = 15.0,     # was 20.0 — more achievable on wide-angle lenses
         sustained_frames: int = SUSTAINED_FRAMES,
-        return_frames: int = 5,          # must return toward center
+        return_frames: int = 3,          # was 5 — faster return detection
     ):
         assert direction in ("left", "right"), "direction must be 'left' or 'right'"
         self.direction = direction

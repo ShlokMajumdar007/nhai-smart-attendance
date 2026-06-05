@@ -385,6 +385,51 @@ class DatabaseManager:
             )
             return cur.fetchone() is not None
 
+    def get_all_users(self) -> List[UserRecord]:
+        """Return a list of all enrolled users (without deserialising embeddings)."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT user_id, employee_code, name, department, embedding, last_seen, created_at "
+                "FROM users ORDER BY name"
+            )
+            rows = cur.fetchall()
+        return [self._row_to_user(row) for row in rows]
+
+    def delete_user(self, user_id: str) -> bool:
+        """
+        Permanently delete a user and all associated data.
+
+        Removes the user from:
+          - users              (primary profile + embedding)
+          - embeddings         (legacy embedding mirror)
+          - attendance_logs    (new attendance table)
+          - attendance         (legacy attendance table)
+
+        Returns True if the user existed and was deleted, False otherwise.
+        """
+        if not self.user_exists(user_id):
+            logger.warning("delete_user: user_id=%s not found — nothing deleted.", user_id)
+            return False
+
+        try:
+            with self._cursor() as cur:
+                # Remove from legacy embeddings table
+                cur.execute("DELETE FROM embeddings WHERE subject_id = ?", (user_id,))
+                # Remove attendance records (new table)
+                cur.execute("DELETE FROM attendance_logs WHERE user_id = ?", (user_id,))
+                # Remove attendance records (legacy table)
+                cur.execute("DELETE FROM attendance WHERE subject_id = ?", (user_id,))
+                # Finally remove the user profile itself
+                cur.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+
+            logger.info(
+                "delete_user: user_id=%s permanently deleted from all tables.", user_id
+            )
+            return True
+        except Exception as exc:
+            logger.error("delete_user: failed to delete user_id=%s: %s", user_id, exc, exc_info=True)
+            return False
+
     # ------------------------------------------------------------------
     # Attendance operations
     # ------------------------------------------------------------------

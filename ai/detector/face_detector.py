@@ -43,11 +43,11 @@ class FaceDetector:
     def __init__(
         self,
         min_face_size: int = 80,
-        blur_threshold: float = 100.0,
-        brightness_min: int = 40,
+        blur_threshold: float = 15.0,       # FIXED: was 100.0 — way too aggressive for webcams indoors
+        brightness_min: int = 20,           # FIXED: was 40 — slightly dim rooms were rejected
         brightness_max: int = 255,
         target_size: Tuple[int, int] = (112, 112),
-        min_detection_confidence: float = 0.7,
+        min_detection_confidence: float = 0.50,  # FIXED: was 0.7 — too many valid faces rejected
         static_image_mode: bool = False,
     ):
         self.min_face_size = min_face_size

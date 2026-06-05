@@ -27,12 +27,18 @@ logger = logging.getLogger(__name__)
 # Tunable constants
 # ---------------------------------------------------------------------------
 
-CAPTURE_FRAMES: int = 15
+# Tuned for universal camera acceptance:
+# - CAPTURE_FRAMES raised to 20 for more attempts on slow/laggy cameras
+# - KEEP_FRAMES stays at 12 — we select the best out of 20
+# - MIN_FACE_SIZE lowered to 60 — wide-angle cameras can have smaller face bbox
+# - MAX_BLUR_VARIANCE lowered to 10 (webcams rarely score > 100; old 15 was too strict)
+# - Brightness bounds widened for dim/bright rooms
+CAPTURE_FRAMES: int = 20
 KEEP_FRAMES: int = 12
-MIN_FACE_SIZE: int = 80
-MAX_BLUR_VARIANCE: float = 15.0
-MIN_BRIGHTNESS: float = 40.0
-MAX_BRIGHTNESS: float = 255.0
+MIN_FACE_SIZE: int = 60           # was 80 — wide-angle/far cameras have smaller faces
+MAX_BLUR_VARIANCE: float = 10.0   # was 15 — still accepts slightly soft webcam frames
+MIN_BRIGHTNESS: float = 20.0      # was 40 — dim-room acceptance
+MAX_BRIGHTNESS: float = 250.0     # was 255 — near-saturated frames still ok
 FRAME_CAPTURE_DELAY: float = 0.12
 FACE_INPUT_SIZE: Tuple[int, int] = (112, 112)
 
@@ -349,7 +355,7 @@ class EnrollmentManager:
             read_fn = camera.read
 
         attempts = 0
-        max_attempts = CAPTURE_FRAMES * 3
+        max_attempts = CAPTURE_FRAMES * 5  # was *3 — more retries on laggy cameras
         no_frame_count = 0
         no_face_count = 0
         faces_detected = 0

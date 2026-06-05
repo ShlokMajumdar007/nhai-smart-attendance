@@ -23,10 +23,15 @@ RIGHT_EYE_LOWER = [374, 380, 381, 382]
 RIGHT_EYE_INNER = 362
 RIGHT_EYE_OUTER = 263
 
-EAR_CLOSED_THRESHOLD = 0.20
-EAR_OPEN_THRESHOLD = 0.25
-MIN_BLINK_FRAMES = 2
-MAX_BLINK_FRAMES = 15  # Too long = not a blink
+# Tuned for universal camera acceptance:
+# - Higher closed threshold (0.22) catches blinks on low-res/compressed webcam feeds
+# - Wider open threshold gap avoids false triggers on camera compression artifacts
+# - MAX_BLINK_FRAMES raised to 25 for laggy/low-fps USB or laptop cameras
+# - MIN_BLINK_FRAMES = 1 so fast blinks on high-fps cameras still register
+EAR_CLOSED_THRESHOLD = 0.22
+EAR_OPEN_THRESHOLD   = 0.28
+MIN_BLINK_FRAMES     = 1
+MAX_BLINK_FRAMES     = 25  # handles low-fps cameras (15 fps × ~1.5 s blink)
 
 
 def eye_aspect_ratio(landmarks: np.ndarray, upper_idx: list, lower_idx: list,

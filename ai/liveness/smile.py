@@ -23,8 +23,11 @@ LOWER_LIP_RIGHT = 324
 MOUTH_CORNER_LEFT = 61
 MOUTH_CORNER_RIGHT = 291
 
-SMILE_RATIO_THRESHOLD = 0.35  # width/height ratio for smile
-SMILE_CORNER_RISE = 5.0        # pixels corners must rise
+# Tuned for universal camera acceptance:
+# - Lower MAR threshold (0.30) detects subtle smiles on compressed/low-res feeds
+# - SMILE_CORNER_RISE kept as reference, MAR is the primary gate
+SMILE_RATIO_THRESHOLD = 0.30  # was 0.35 — more lenient for low-res webcams
+SMILE_CORNER_RISE = 5.0        # pixels corners must rise (reference only)
 
 
 def mouth_aspect_ratio(landmarks: np.ndarray) -> float:
@@ -54,7 +57,7 @@ class SmileDetector:
     def __init__(
         self,
         mar_threshold: float = SMILE_RATIO_THRESHOLD,
-        sustained_frames: int = 10,
+        sustained_frames: int = 6,   # was 10 — easier to sustain on low-fps cameras
         neutral_mar: Optional[float] = None,
     ):
         self.mar_threshold = mar_threshold
@@ -84,7 +87,7 @@ class SmileDetector:
         # Dynamic threshold if calibrated
         threshold = self.mar_threshold
         if self._calibrated and self._baseline_mar is not None:
-            threshold = self._baseline_mar * 1.4  # 40% increase from neutral
+            threshold = self._baseline_mar * 1.3  # was 1.4 — 30% increase is enough on compressed feeds
 
         is_smiling = mar > threshold
 

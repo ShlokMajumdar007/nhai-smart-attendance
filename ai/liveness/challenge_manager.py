@@ -33,7 +33,8 @@ CHALLENGE_PROMPTS = {
     ChallengeType.SMILE: "Please smile",
 }
 
-CHALLENGE_TIMEOUT_SECONDS = 8.0
+# 15 s gives users enough time even on laggy/low-fps cameras (was 8 s — too short)
+CHALLENGE_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass
@@ -178,7 +179,7 @@ class ChallengeManager:
             if not self._calibration_done:
                 self._detector.calibrate(landmarks)
                 self._calibration_frame_count += 1
-                if self._calibration_frame_count >= 20:
+                if self._calibration_frame_count >= 10:  # was 20 — calibrate faster
                     self._calibration_done = True
                 progress = 0.0
             else:

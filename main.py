@@ -68,14 +68,14 @@ class SystemConfig:
     camera_width: int = 1280
     camera_height: int = 720
     camera_fps: int = 30
-    recognition_threshold: float = 0.60
+    recognition_threshold: float = 0.55       # lowered: model works well at 0.55+
     attendance_cooldown_seconds: int = 300
-    liveness_enabled: bool = True
+    liveness_enabled: bool = True             # liveness is the main anti-spoofing feature
     sync_interval_seconds: int = 60
     max_sync_retries: int = 3
-    min_face_confidence: float = 0.75
-    min_blur_threshold: float = 30.0
-    min_brightness: float = 30.0
+    min_face_confidence: float = 0.50         # FIXED: was 0.75 — too aggressive, rejected valid faces
+    min_blur_threshold: float = 15.0          # FIXED: was 30.0 — indoor cameras rarely hit 30
+    min_brightness: float = 20.0              # FIXED: was 30.0 — slightly too dark rooms were rejected
     max_brightness: float = 253.0
     model_dir: str = "ai/models"
     db_path: str = "data/drishti.db"
@@ -98,6 +98,10 @@ class PipelineState:
     successful_recognitions: int = 0
     failed_recognitions: int = 0
     attendance_marked_count: int = 0
+    # Liveness challenge prompt shown on HUD each frame
+    liveness_prompt: Optional[str] = None
+    liveness_time_remaining: float = 0.0
+    liveness_progress: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -478,23 +482,57 @@ class CameraProcessor:
 
         self._state.detection_attempt_count += 1
 
+        # Clear liveness prompt when no face is detected
+        self._state.liveness_prompt = None
+
         detection = self._recognition.detect_and_validate(frame)
         if detection is None:
             return
 
         self._state.last_detection_time = time.time()
 
-        # Liveness check
-        liveness_passed = self._recognition.run_liveness(frame, detection)
-        if liveness_passed is None or not liveness_passed:
-            return
+        # ── Liveness check ─────────────────────────────────────────────
+        # The challenge manager is stateful: it starts a challenge on the first
+        # call and returns False while pending, True when passed.
+        # We grab the challenge state BEFORE calling process() so we can
+        # display the prompt on the HUD (the ROOT CAUSE of the bug: without the
+        # prompt on screen, users had no idea what to do and timed out forever).
+        challenge_mgr = self._recognition._challenge_mgr
+        if self._config.liveness_enabled and challenge_mgr is not None:
+            current = challenge_mgr.current_challenge
+            if current is not None and not challenge_mgr.passed:
+                from ai.liveness.challenge_manager import CHALLENGE_PROMPTS
+                self._state.liveness_prompt = CHALLENGE_PROMPTS.get(current, str(current))
+                # Compute time remaining from challenge state
+                import time as _time
+                if challenge_mgr._start_time is not None:
+                    elapsed = _time.monotonic() - challenge_mgr._start_time
+                    self._state.liveness_time_remaining = max(0.0, challenge_mgr.timeout - elapsed)
+            else:
+                self._state.liveness_prompt = None
 
-        # Embedding extraction
+        liveness_passed = self._recognition.run_liveness(frame, detection)
+        # None means liveness disabled → treat as passed
+        liveness_ok = (liveness_passed is None) or (liveness_passed is True)
+
+        # Update HUD prompt after running liveness (challenge may have just started)
+        if self._config.liveness_enabled and challenge_mgr is not None:
+            current = challenge_mgr.current_challenge
+            if current is not None and not challenge_mgr.passed:
+                from ai.liveness.challenge_manager import CHALLENGE_PROMPTS
+                self._state.liveness_prompt = CHALLENGE_PROMPTS.get(current, str(current))
+            elif liveness_ok and liveness_passed is True:
+                self._state.liveness_prompt = "✓ Liveness passed!"
+
+        # ── Embedding + Recognition ────────────────────────────────────
+        # Recognition always runs — liveness only gates attendance marking.
+        # This means the system still identifies the person while they complete
+        # the challenge, and marks attendance the moment liveness passes.
         embedding = self._recognition.extract_embedding(detection)
         if embedding is None:
             self._state.failed_recognitions += 1
             return
-        # Recognition
+
         result = self._recognition.recognize(embedding)
         if result is None:
             self._state.failed_recognitions += 1
@@ -509,16 +547,23 @@ class CameraProcessor:
 
         self._state.successful_recognitions += 1
         self._log.info(
-            "Face recognised — subject=%s confidence=%.3f", subject_id, confidence
+            "Face recognised — subject=%s confidence=%.3f liveness_ok=%s",
+            subject_id, confidence, liveness_ok,
         )
 
-        # Attendance
-        marked = self._attendance.mark(subject_id, result, embedding)
-        if marked:
-            self._state.attendance_marked_count += 1
+        # Attendance: only mark once liveness is confirmed
+        marked = False
+        if liveness_ok:
+            marked = self._attendance.mark(subject_id, result, embedding)
+            if marked:
+                self._state.attendance_marked_count += 1
+                self._state.liveness_prompt = None   # clear prompt on success
+        else:
+            self._log.info(
+                "Recognised %s (conf=%.3f) — waiting for liveness challenge",
+                subject_id, confidence,
+            )
 
-        # Annotate frame in-place with recognition result.
-        # imshow is called by the run() loop after this returns.
         self._draw_overlay(frame, detection, subject_id, confidence, marked, result)
 
     def _draw_overlay(
@@ -553,9 +598,9 @@ class CameraProcessor:
         """
         Burn a diagnostic HUD onto every frame.
 
-        Bottom bar: enrolled count + controls.
-        Top bar: live brightness, blur score, and last rejection reason
-        so the operator can immediately see why recognition is failing.
+        - Top bar  : brightness / blur diagnostics + threshold
+        - Centre   : liveness challenge prompt (BIG, impossible to miss)
+        - Bottom   : enrolled count + controls
         """
         h, w = frame.shape[:2]
         enrolled = self._embedding_cache.get_enrolled_count()
@@ -596,6 +641,47 @@ class CameraProcessor:
         (tw, _), _ = cv2.getTextSize(thr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
         cv2.putText(frame, thr_text, (w - tw - 10, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 180, 180), 1)
+
+        # ── LIVENESS CHALLENGE PROMPT (centre of frame) ─────────────────
+        # This was missing entirely before — the ROOT CAUSE of liveness never
+        # working: users couldn't see what challenge they needed to perform.
+        prompt = self._state.liveness_prompt
+        if prompt:
+            passed_prompt = prompt.startswith("✓")
+            prompt_color   = (80, 220, 80) if passed_prompt else (0, 220, 255)
+            banner_color   = (0, 100, 0)   if passed_prompt else (0, 60, 120)
+
+            font       = cv2.FONT_HERSHEY_DUPLEX
+            font_scale = 1.0
+            thickness  = 2
+            (tw, th), baseline = cv2.getTextSize(prompt, font, font_scale, thickness)
+
+            # Centre horizontally, place at ~60 % height so it sits below the face bbox
+            px = (w - tw) // 2
+            py = int(h * 0.62)
+
+            # Semi-transparent banner behind text
+            pad = 16
+            bx1, by1 = px - pad, py - th - pad
+            bx2, by2 = px + tw + pad, py + baseline + pad
+            banner_overlay = frame.copy()
+            cv2.rectangle(banner_overlay, (bx1, by1), (bx2, by2), banner_color, -1)
+            cv2.addWeighted(banner_overlay, 0.72, frame, 0.28, 0, frame)
+
+            cv2.putText(frame, prompt, (px, py), font, font_scale, prompt_color, thickness)
+
+            # Timer bar (only while waiting, not on "passed" message)
+            if not passed_prompt and self._state.liveness_time_remaining > 0:
+                challenge_mgr = self._recognition._challenge_mgr
+                total = challenge_mgr.timeout if challenge_mgr else 15.0
+                ratio = self._state.liveness_time_remaining / total
+                bar_w = int((bx2 - bx1) * ratio)
+                bar_y = by2 + 4
+                # Background bar (grey)
+                cv2.rectangle(frame, (bx1, bar_y), (bx2, bar_y + 6), (60, 60, 60), -1)
+                # Foreground bar (yellow → red as time runs out)
+                bar_color = (0, int(200 * ratio), 220) if ratio > 0.3 else (0, 60, 220)
+                cv2.rectangle(frame, (bx1, bar_y), (bx1 + bar_w, bar_y + 6), bar_color, -1)
 
         # ── bottom status bar ───────────────────────────────────────────
         banner_h = 36
@@ -994,6 +1080,141 @@ class DrishtiApplication:
             cap.release()
             self._log.info("Enrollment camera released.")
 
+    def run_delete_user_interactive(self) -> None:
+        """
+        Interactive CLI flow to permanently delete an enrolled user.
+
+        Lists all users, lets the operator choose one by number or employee
+        code, asks for a hard confirmation, deletes from all tables, then
+        reloads the embedding cache so recognition immediately reflects the
+        change.
+        """
+        print("\n" + "=" * 55)
+        print("  NHAI Drishti — Delete / Remove Employee")
+        print("=" * 55)
+
+        users = self._db_manager.get_all_users()
+        if not users:
+            print("\n  No enrolled users found. Nothing to delete.\n")
+            return
+
+        # ── Print user table ────────────────────────────────────────────
+        print(f"\n  {'#':<4}  {'Employee Code':<16}  {'Name':<24}  {'Department':<20}  {'Last Seen'}")
+        print("  " + "-" * 88)
+        for i, u in enumerate(users, start=1):
+            last_seen = u.last_seen if u.last_seen else "Never"
+            print(f"  {i:<4}  {u.employee_code:<16}  {u.name:<24}  {u.department:<20}  {last_seen}")
+        print()
+
+        # ── Ask which user to delete ─────────────────────────────────────
+        try:
+            raw = input("  Enter Employee Code to delete, # to delete ALL, or ENTER to cancel: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  [CANCELLED]")
+            return
+
+        if not raw:
+            print("  [CANCELLED] No user selected.")
+            return
+
+        # ── Delete ALL users ─────────────────────────────────────────────
+        if raw == "#":
+            print("\n  " + "!" * 53)
+            print("  !! WARNING: This will permanently delete ALL users  !!")
+            print(f"  !!   Total users to delete: {len(users):<24}!!")
+            print("  !!   All attendance records will be removed.        !!")
+            print("  " + "!" * 53)
+            print()
+
+            try:
+                confirm = input("  Type DELETE ALL to confirm, or anything else to cancel: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n  [CANCELLED]")
+                return
+
+            if confirm != "DELETE ALL":
+                print("  [CANCELLED] Deletion aborted — all user data is intact.")
+                return
+
+            deleted_count = 0
+            failed_count = 0
+            for u in users:
+                if self._db_manager.delete_user(u.user_id):
+                    deleted_count += 1
+                    self._log.info(
+                        "Bulk delete — removed user_id=%s employee_code=%s name=%s",
+                        u.user_id, u.employee_code, u.name,
+                    )
+                else:
+                    failed_count += 1
+                    self._log.error(
+                        "Bulk delete — FAILED for user_id=%s employee_code=%s",
+                        u.user_id, u.employee_code,
+                    )
+
+            count = self._embedding_cache.load_embeddings()
+            print("\n" + "-" * 55)
+            print(f"  ✓  BULK DELETE COMPLETE")
+            print(f"     Deleted        : {deleted_count}")
+            if failed_count:
+                print(f"     Failed         : {failed_count}")
+            print(f"     Cache reload   : {count} user(s) now in memory")
+            print("-" * 55 + "\n")
+            return
+
+        # ── Resolve selection by employee code (case-insensitive) ────────
+        target_user = None
+        for u in users:
+            if u.employee_code.lower() == raw.lower():
+                target_user = u
+                break
+
+        if target_user is None:
+            print(f"  [ERROR] Employee code '{raw}' not found.")
+            return
+
+        # ── Safety confirmation ──────────────────────────────────────────
+        print("\n  " + "!" * 53)
+        print(f"  !! WARNING: This will permanently delete:           !!")
+        print(f"  !!   Name          : {target_user.name:<32}!!")
+        print(f"  !!   Employee Code : {target_user.employee_code:<32}!!")
+        print(f"  !!   User ID       : {target_user.user_id:<32}!!")
+        print("  !!   All attendance records for this user.          !!")
+        print("  " + "!" * 53)
+        print()
+
+        try:
+            confirm = input("  Type DELETE to confirm, or anything else to cancel: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  [CANCELLED]")
+            return
+
+        if confirm != "DELETE":
+            print("  [CANCELLED] Deletion aborted — user data is intact.")
+            return
+
+        # ── Perform deletion ─────────────────────────────────────────────
+        success = self._db_manager.delete_user(target_user.user_id)
+        if success:
+            # Reload embedding cache so the deleted face is removed immediately
+            count = self._embedding_cache.load_embeddings()
+            print("\n" + "-" * 55)
+            print("  ✓  USER DELETED SUCCESSFULLY")
+            print(f"     Name          : {target_user.name}")
+            print(f"     Employee Code : {target_user.employee_code}")
+            print(f"     Cache reload  : {count} user(s) now in memory")
+            print("-" * 55 + "\n")
+            self._log.info(
+                "User deleted — user_id=%s employee_code=%s name=%s; cache now has %d user(s).",
+                target_user.user_id, target_user.employee_code, target_user.name, count,
+            )
+        else:
+            print("\n  [ERROR] Deletion failed. Check the log for details.")
+            self._log.error(
+                "Deletion failed for user_id=%s (%s).",
+                target_user.user_id, target_user.employee_code,
+            )
+
     def run(self) -> int:
         """Legacy single-shot run — kept for backward compatibility."""
         return self.run_recognition()
@@ -1048,11 +1269,12 @@ def _print_menu(enrolled_count: int) -> str:
         print("\n  Select mode:")
         print("    [1]  Recognition   — identify employees and mark attendance")
         print("    [2]  Enrollment    — register a new employee")
+        print("    [3]  Delete User   — permanently remove an enrolled employee")
         print("    [Q]  Quit\n")
         choice = input("  Enter choice: ").strip().lower()
-        if choice in ("1", "2", "q", "quit", "exit"):
+        if choice in ("1", "2", "3", "q", "quit", "exit"):
             return choice
-        print("  Invalid option — please enter 1, 2, or Q.\n")
+        print("  Invalid option — please enter 1, 2, 3, or Q.\n")
 
 
 def main() -> int:
@@ -1115,6 +1337,11 @@ def main() -> int:
             print("\n  Starting Enrollment Mode …")
             logger.info("Entering ENROLLMENT mode.")
             app.run_enrollment_interactive()
+
+        elif choice == "3":
+            # ---- DELETE USER MODE ----------------------------------------
+            logger.info("Entering DELETE USER mode.")
+            app.run_delete_user_interactive()
 
     return app.shutdown()
 
