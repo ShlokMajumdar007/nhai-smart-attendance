@@ -117,6 +117,27 @@ CREATE TABLE IF NOT EXISTS sync_queue (
 );
 """
 
+_DDL_LEGACY_EMBEDDINGS = """
+CREATE TABLE IF NOT EXISTS embeddings (
+    subject_id TEXT PRIMARY KEY,
+    embedding  TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (subject_id) REFERENCES users(user_id)
+);
+"""
+
+_DDL_LEGACY_ATTENDANCE = """
+CREATE TABLE IF NOT EXISTS attendance (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id TEXT NOT NULL,
+    confidence REAL,
+    timestamp  TEXT NOT NULL,
+    metadata   TEXT,
+    synced     INTEGER DEFAULT 0,
+    FOREIGN KEY (subject_id) REFERENCES users(user_id)
+);
+"""
+
 _DDL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code);",
     "CREATE INDEX IF NOT EXISTS idx_attendance_user_id  ON attendance_logs(user_id);",
@@ -211,6 +232,8 @@ class DatabaseManager:
             cur.execute(_DDL_USERS)
             cur.execute(_DDL_ATTENDANCE)
             cur.execute(_DDL_SYNC)
+            cur.execute(_DDL_LEGACY_EMBEDDINGS)
+            cur.execute(_DDL_LEGACY_ATTENDANCE)
             for idx_sql in _DDL_INDEXES:
                 cur.execute(idx_sql)
         logger.debug("Database schema verified.")
@@ -220,14 +243,19 @@ class DatabaseManager:
     # ------------------------------------------------------------------
 
     def add_user(self, record: UserRecord) -> bool:
-        sql = """
+        sql_user = """
             INSERT INTO users
                 (user_id, employee_code, name, department, embedding, last_seen, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """
+        sql_emb = """
+            INSERT INTO embeddings
+                (subject_id, embedding, created_at)
+            VALUES (?, ?, ?)
+        """
         try:
             with self._cursor() as cur:
-                cur.execute(sql, (
+                cur.execute(sql_user, (
                     record.user_id,
                     record.employee_code,
                     record.name,
@@ -236,8 +264,13 @@ class DatabaseManager:
                     record.last_seen,
                     record.created_at,
                 ))
+                cur.execute(sql_emb, (
+                    record.user_id,
+                    _embedding_to_json(record.embedding),
+                    record.created_at,
+                ))
             logger.info(
-                "User added: %s (%s) dept=%s",
+                "User added: %s (%s) dept=%s (both users and embeddings tables populated)",
                 record.name, record.employee_code, record.department,
             )
             return True
@@ -246,6 +279,46 @@ class DatabaseManager:
                 "add_user failed – employee_code already exists: %s",
                 record.employee_code,
             )
+            return False
+
+    def save_user(self, user_id: str, employee_code: str, name: str, department: str) -> bool:
+        """Alias/wrapper to insert a user with an empty embedding."""
+        record = UserRecord(
+            user_id=user_id,
+            employee_code=employee_code,
+            name=name,
+            department=department,
+            embedding=np.zeros(128, dtype=np.float32),
+            last_seen=None,
+            created_at=_now_iso()
+        )
+        return self.add_user(record)
+
+    def save_embedding(self, user_id: str, embedding: np.ndarray) -> bool:
+        """Update/save embedding for a user in both users and legacy embeddings tables."""
+        embedding_json = _embedding_to_json(embedding)
+        try:
+            with self._cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET embedding = ? WHERE user_id = ?",
+                    (embedding_json, user_id)
+                )
+                cur.execute("SELECT 1 FROM embeddings WHERE subject_id = ?", (user_id,))
+                exists = cur.fetchone() is not None
+                if exists:
+                    cur.execute(
+                        "UPDATE embeddings SET embedding = ? WHERE subject_id = ?",
+                        (embedding_json, user_id)
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO embeddings (subject_id, embedding, created_at) VALUES (?, ?, ?)",
+                        (user_id, embedding_json, _now_iso())
+                    )
+            logger.info("Embedding saved/updated for user_id=%s in both tables", user_id)
+            return True
+        except Exception as exc:
+            logger.error("Failed to save embedding for user_id=%s: %s", user_id, exc)
             return False
 
     def get_user(self, user_id: str) -> Optional[UserRecord]:
@@ -317,13 +390,18 @@ class DatabaseManager:
     # ------------------------------------------------------------------
 
     def log_attendance(self, record: AttendanceRecord) -> int:
-        sql = """
+        sql_log = """
             INSERT INTO attendance_logs
                 (user_id, confidence, challenge_type, liveness_passed, timestamp, synced)
             VALUES (?, ?, ?, ?, ?, ?)
         """
+        sql_legacy = """
+            INSERT INTO attendance
+                (subject_id, confidence, timestamp, metadata, synced)
+            VALUES (?, ?, ?, ?, ?)
+        """
         with self._cursor() as cur:
-            cur.execute(sql, (
+            cur.execute(sql_log, (
                 record.user_id,
                 record.confidence,
                 record.challenge_type,
@@ -332,9 +410,21 @@ class DatabaseManager:
                 int(record.synced),
             ))
             row_id: int = cur.lastrowid  # type: ignore[assignment]
+            
+            metadata_json = json.dumps({
+                "challenge_type": record.challenge_type,
+                "liveness_passed": record.liveness_passed
+            })
+            cur.execute(sql_legacy, (
+                record.user_id,
+                record.confidence,
+                record.timestamp,
+                metadata_json,
+                int(record.synced),
+            ))
 
         logger.info(
-            "Attendance logged: user=%s conf=%.3f id=%d",
+            "Attendance logged: user=%s conf=%.3f id=%d (both attendance_logs and attendance tables populated)",
             record.user_id, record.confidence, row_id,
         )
         return row_id

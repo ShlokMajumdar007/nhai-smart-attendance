@@ -190,10 +190,11 @@ class EnrollmentManager:
             )
 
         # --- Step 1: Capture frames ---
-        raw_frames, face_boxes = self._capture_frames(camera)
+        raw_frames, face_boxes, aligned_faces, faces_detected = self._capture_frames(camera)
         frames_captured = len(raw_frames)
 
         if frames_captured == 0:
+            logger.warning("Enrollment aborted — no frames captured.")
             return self._failed_report(
                 employee_code=employee_code, name=name, department=department,
                 reason="No frames captured. Check camera.",
@@ -217,6 +218,7 @@ class EnrollmentManager:
         logger.info("Quality check: %d/%d frames passed.", frames_passed, frames_captured)
 
         if frames_passed < 3:
+            logger.warning("Enrollment aborted — too few quality frames (%d/%d passed).", frames_passed, frames_captured)
             return self._failed_report(
                 employee_code=employee_code, name=name, department=department,
                 reason=(
@@ -236,11 +238,16 @@ class EnrollmentManager:
         # --- Step 4: Generate embeddings ---
         embeddings: List[np.ndarray] = []
         for idx in selected_indices:
-            emb = self._extract_embedding(raw_frames[idx], face_boxes[idx])
-            if emb is not None:
-                embeddings.append(emb)
+            # Pass pre-aligned, pre-equalized and pre-normalized face directly
+            try:
+                emb = self._net.get_embedding(aligned_faces[idx])
+                if emb is not None:
+                    embeddings.append(emb)
+            except Exception as e:
+                logger.error("Embedding generation failed for frame %d: %s", idx, e)
 
         if not embeddings:
+            logger.error("Enrollment aborted — embedding extraction failed for all selected frames.")
             return self._failed_report(
                 employee_code=employee_code, name=name, department=department,
                 reason="Embedding extraction failed for all selected frames.",
@@ -252,6 +259,7 @@ class EnrollmentManager:
         mean_embedding = np.mean(np.stack(embeddings, axis=0), axis=0)
         norm = np.linalg.norm(mean_embedding)
         if norm < 1e-8:
+            logger.error("Enrollment aborted — averaged embedding has near-zero norm.")
             return self._failed_report(
                 employee_code=employee_code, name=name, department=department,
                 reason="Averaged embedding has near-zero norm.",
@@ -275,7 +283,24 @@ class EnrollmentManager:
         )
 
         stored = self._db.add_user(record)
+        
+        # Log all enrollment metrics as required by audit
+        logger.info(
+            "Enrollment Metrics:\n"
+            "  - frames_captured: %d\n"
+            "  - faces_detected: %d\n"
+            "  - quality_passed: %d\n"
+            "  - embeddings_generated: %d\n"
+            "  - database_save_success: %s",
+            frames_captured,
+            faces_detected,
+            frames_passed,
+            len(embeddings),
+            "True" if stored else "False"
+        )
+
         if not stored:
+            logger.error("Enrollment aborted — database write failed.")
             return self._failed_report(
                 employee_code=employee_code, name=name, department=department,
                 reason="Database write failed (possible duplicate).",
@@ -310,9 +335,10 @@ class EnrollmentManager:
     def _capture_frames(
         self,
         camera,
-    ) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
+    ) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]], List[np.ndarray], int]:
         frames: List[np.ndarray] = []
         boxes: List[Tuple[int, int, int, int]] = []
+        aligned_faces: List[np.ndarray] = []
 
         # Accept either a cv2.VideoCapture (has .read() method) or a plain
         # callable that returns (ok, frame) — used when CameraProcessor shares
@@ -326,6 +352,7 @@ class EnrollmentManager:
         max_attempts = CAPTURE_FRAMES * 3
         no_frame_count = 0
         no_face_count = 0
+        faces_detected = 0
 
         logger.info(
             "_capture_frames START: target=%d max_attempts=%d read_fn=%s",
@@ -345,6 +372,9 @@ class EnrollmentManager:
                 no_face_count += 1
                 time.sleep(FRAME_CAPTURE_DELAY)
                 continue
+            
+            faces_detected += 1
+
             if not detection.is_valid:
                 no_face_count += 1
                 logger.debug("Frame rejected: %s", detection.rejection_reason)
@@ -355,6 +385,7 @@ class EnrollmentManager:
             x1, y1, fw, fh = detection.bbox
             frames.append(frame.copy())
             boxes.append((x1, y1, fw, fh))
+            aligned_faces.append(detection.aligned_face.copy())
             logger.info("attempt %d/%d: frame %d accepted (bbox=%s)",
                         attempts, max_attempts, len(frames), detection.bbox)
             time.sleep(FRAME_CAPTURE_DELAY)
@@ -363,7 +394,7 @@ class EnrollmentManager:
             "_capture_frames END: collected=%d/%d attempts=%d no_frame=%d no_face=%d",
             len(frames), CAPTURE_FRAMES, attempts, no_frame_count, no_face_count,
         )
-        return frames, boxes
+        return frames, boxes, aligned_faces, faces_detected
 
     def _extract_embedding(
         self,

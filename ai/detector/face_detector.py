@@ -31,6 +31,7 @@ class FaceDetection:
     brightness: float
     is_valid: bool
     rejection_reason: Optional[str] = None
+    pose: Optional[dict] = None
 
 
 class FaceDetector:
@@ -174,6 +175,9 @@ class FaceDetector:
         if det_result.detections:
             confidence = det_result.detections[0].score[0]
 
+        # Calculate head pose
+        pose = self.get_head_pose(landmarks_px, frame.shape)
+
         return FaceDetection(
             bbox=(x1, y1, face_w, face_h),
             landmarks=landmarks_px,
@@ -182,6 +186,7 @@ class FaceDetector:
             blur_score=blur_score,
             brightness=brightness,
             is_valid=True,
+            pose=pose,
         )
 
     def _align_face(
