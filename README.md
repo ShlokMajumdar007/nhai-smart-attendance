@@ -1,4 +1,4 @@
-# NHAI Drishti 👁️
+# NHAI Drishti 
 ### Offline AI-Powered Face Authentication & Attendance System
 
 > Hackathon Submission — Smart India Hackathon / NHAI  
