@@ -260,10 +260,9 @@ python main.py
 
 | Role | Name |
 |------|------|
-| Lead Engineer | — |
-| AI/ML Engineer | — |
-| Backend Engineer | — |
-
+| AI/ML Engineer | Shlok Majumdar |
+| Backend Engineer | Blesson T Abraham |
+| Frontend Engineer | Priyansh Bhatt |
 ---
 
 ## License
